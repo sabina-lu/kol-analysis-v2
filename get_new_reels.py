@@ -325,42 +325,30 @@ def get_profile_post_count(driver: webdriver.Chrome, username: str) -> Optional[
         url = f"https://www.instagram.com/{username}/"
         driver.get(url)
 
-        # 等待 header 裡的 ul 出現（貼文數在這裡）
         try:
-            WebDriverWait(driver, 10).until(
+            WebDriverWait(driver, 15).until(
                 EC.presence_of_element_located((By.XPATH, "//header//ul/li"))
             )
         except:
             pass
 
-        # 試幾個常見的 XPath
-        xpaths = [
-            "//header//ul/li[1]//span[@title]",
-            "//header//ul/li[1]//span/span",
-            "//main//header//section//ul/li[1]//span[@title]",
-            "//main//header//section//ul/li[1]//span/span",
-            "//header//ul/li[1]/button/span/span",  # 新版 UI
-            "//header//ul/li[1]/span/span",
-        ]
+        time.sleep(3)  # 等 React 渲染
 
-        for xpath in xpaths:
-            try:
-                elements = driver.find_elements(By.XPATH, xpath)
-                for el in elements:
-                    candidate = (el.get_attribute("title") or el.text or "").strip()
-                    print(f"DEBUG xpath={xpath} candidate={repr(candidate)}")
-                    count = normalize_count_text(candidate)
-                    if count is not None:
-                        print(f"ℹ️ {username} post count (xpath): {count}")
-                        return count
-            except Exception as e:
-                print(f"DEBUG xpath error {xpath}: {e}")
-                continue
+        # ===== DEBUG: 印出 header 裡的所有文字 =====
+        try:
+            header = driver.find_element(By.TAG_NAME, "header")
+            print(f"DEBUG header HTML:\n{header.get_attribute('innerHTML')[:3000]}")
+        except Exception as e:
+            print(f"DEBUG no header found: {e}")
 
-        # fallback: 印出 page source 供 debug
-        html = driver.page_source or ""
-        print(f"DEBUG page_source length: {len(html)}")
-        print(f"DEBUG first 3000 chars:\n{html[:3000]}")
+        # ===== DEBUG: 抓所有 li 元素 =====
+        try:
+            lis = driver.find_elements(By.XPATH, "//ul/li")
+            print(f"DEBUG li count: {len(lis)}")
+            for i, li in enumerate(lis[:10]):
+                print(f"DEBUG li[{i}] text={repr(li.text)} html={li.get_attribute('innerHTML')[:200]}")
+        except Exception as e:
+            print(f"DEBUG li error: {e}")
 
         print(f"⚠️ Could not read post count for {username}")
         return None
@@ -368,6 +356,7 @@ def get_profile_post_count(driver: webdriver.Chrome, username: str) -> Optional[
     except Exception as exc:
         print(f"❌ Error getting post count: {exc}")
         return None
+
 
 # ========= API fetch for changed accounts only =========
 def get_profile_info(username: str, driver: Optional[webdriver.Chrome] = None):
