@@ -410,7 +410,7 @@ def get_profile_post_count(driver: webdriver.Chrome, username: str) -> Optional[
 
 
 # ========= API fetch for changed accounts only =========
-def get_profile_info(driver: webdriver.Chrome, username: str):
+def get_profile_info(username: str, driver: webdriver.Chrome):
     """直接從目前已載入的 profile 頁面抽 timeline 資料，不重新開頁"""
     if not driver:
         return None
