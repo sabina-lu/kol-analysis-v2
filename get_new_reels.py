@@ -565,7 +565,7 @@ def get_profile_info(username: str, driver: webdriver.Chrome) -> Optional[dict]:
         seen = set()
         edges = []
 
-        for a in anchors:
+        for a in anchors[:3]:
             href = a.get_attribute("href") or a.get_attribute("href.baseVal") or ""
             if not href:
                 continue
@@ -701,16 +701,6 @@ def extract_reels_within_days(username: str, profile_json: dict, existing_shortc
             continue
 
         post_dt = None
-        if timestamp:
-            try:
-                post_dt = dt.datetime.fromtimestamp(timestamp)
-            except Exception as exc:
-                skipped_no_timestamp += 1
-                print(f"SKIP #{i}: shortcode={shortcode} timestamp parse failed: {exc}")
-                continue
-        else:
-            skipped_no_timestamp += 1
-            print(f"WARN #{i}: shortcode={shortcode} is video but no taken_at_timestamp, will try detail page later")
 
         if post_dt is not None and post_dt < cutoff:
             skipped_old += 1
