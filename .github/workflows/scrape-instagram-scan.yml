@@ -1,5 +1,10 @@
 name: scrape-instagram-scan
 
+env:
+  TZ: Asia/Taipei
+  CHROME_BIN: /usr/bin/google-chrome
+  IG_COOKIE: ${{ secrets.IG_COOKIE }}
+
 on:
   schedule:
     - cron: "13 1 * * *"
@@ -8,11 +13,6 @@ on:
 concurrency:
   group: scrape-instagram-scan
   cancel-in-progress: false
-
-env:
-  TZ: Asia/Taipei
-  CHROME_BIN: /usr/bin/google-chrome
-  IG_COOKIE: ${{ secrets.IG_COOKIE }}
 
 jobs:
   scan-kol-new-posts:

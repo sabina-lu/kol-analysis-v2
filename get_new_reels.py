@@ -28,8 +28,8 @@ DETAIL_DOC_ID = "8845758582119845"
 IG_APP_ID = "936619743392459"
 
 REELS_WINDOW_DAYS = 30
-PROFILE_SLEEP_RANGE = (0.1, 0.3)  # Minimal delay between profiles
-DETAIL_SLEEP_RANGE = (0.1, 0.2)  # Minimal delay between details
+PROFILE_SLEEP_RANGE = (0.5, 1.2)   # slightly longer to let JS hydrate
+DETAIL_SLEEP_RANGE  = (0.3, 0.6)
 
 BASE_HEADERS = {
     "user-agent": (
@@ -190,7 +190,7 @@ def safe_json_get(url: str, headers: dict, referer: Optional[str] = None, timeou
                 time.sleep(1)
                 continue
             return None
-    
+
     return None
 
 
@@ -222,9 +222,7 @@ def normalize_count_text(text: str) -> Optional[int]:
 
 # ========= Selenium profile gate =========
 
-
 def parse_cookie_string(cookie_str: str) -> list[dict]:
-    """把 cookie header 字串轉成 selenium 可用的格式"""
     cookies = []
     for part in cookie_str.split(";"):
         part = part.strip()
@@ -240,9 +238,8 @@ def parse_cookie_string(cookie_str: str) -> list[dict]:
 
 
 def load_cookies_from_string(driver: webdriver.Chrome, cookie_str: str) -> None:
-    """先訪問 instagram 建立 session，再注入 cookie"""
     driver.get("https://www.instagram.com/")
-    time.sleep(2)
+    time.sleep(3)
 
     for cookie in parse_cookie_string(cookie_str):
         try:
@@ -251,8 +248,24 @@ def load_cookies_from_string(driver: webdriver.Chrome, cookie_str: str) -> None:
             print(f"⚠️ Failed to add cookie {cookie['name']}: {e}")
 
     driver.refresh()
-    time.sleep(3)
+    time.sleep(4)
     print("✅ Cookies injected")
+
+
+# [FIX #4] Verify login succeeded before proceeding
+def verify_logged_in(driver: webdriver.Chrome) -> bool:
+    """Navigate to activity page; if redirected to /accounts/login/, cookies failed."""
+    try:
+        driver.get("https://www.instagram.com/accounts/activity/")
+        time.sleep(3)
+        if "login" in driver.current_url:
+            print("❌ Cookie login verification failed — current URL indicates login wall")
+            return False
+        print("✅ Login verified successfully")
+        return True
+    except Exception as exc:
+        print(f"⚠️ Could not verify login status: {exc}")
+        return False
 
 
 def build_driver() -> webdriver.Chrome:
@@ -267,15 +280,12 @@ def build_driver() -> webdriver.Chrome:
     options.add_experimental_option("useAutomationExtension", False)
     options.add_experimental_option("prefs", {"intl.accept_languages": "en,en_US"})
 
-
     chrome_bin = os.environ.get("CHROME_BIN")
     if not chrome_bin:
-        # Check macOS first
         macos_chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
         if os.path.exists(macos_chrome):
             chrome_bin = macos_chrome
         else:
-            # Then check Linux/Unix alternatives
             for candidate in ["google-chrome", "chromium", "chromium-browser", "chrome"]:
                 resolved = shutil.which(candidate)
                 if resolved:
@@ -291,87 +301,157 @@ def build_driver() -> webdriver.Chrome:
     return webdriver.Chrome(options=options)
 
 
-def extract_post_count_from_page_source(driver: webdriver.Chrome) -> Optional[int]:
-    html = driver.page_source or ""
-    patterns = [
-        r'edge_owner_to_timeline_media\":\{\"count\":(\d+)',
-        r'edge_owner_to_timeline_media"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+def normalize_count_text(text: str) -> Optional[int]:
+    if text is None:
+        return None
+    raw = str(text).strip()
+    if not raw:
+        return None
+    raw = raw.replace(",", "").replace(" ", "")
+    match = re.search(r"(\d+(?:\.\d+)?)([KMBkmb]?)", raw)
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = match.group(2).lower()
+    if unit == "k":
+        value *= 1_000
+    elif unit == "m":
+        value *= 1_000_000
+    elif unit == "b":
+        value *= 1_000_000_000
+    return int(round(value))
+
+
+# [FIX #3] Extract post count from in-memory JS store via execute_script
+def extract_count_from_js(driver: webdriver.Chrome) -> Optional[int]:
+    """Query Instagram's in-memory React/JS data store for timeline count."""
+    scripts = [
+        # Try window.__additionalDataLoaded (older IG)
+        """
+        try {
+            const data = window.__additionalDataLoaded || {};
+            for (const key of Object.keys(data)) {
+                const u = (data[key]?.graphql?.user) || (data[key]?.data?.user);
+                if (u && u.edge_owner_to_timeline_media) {
+                    return u.edge_owner_to_timeline_media.count;
+                }
+            }
+        } catch(e) {}
+        return null;
+        """,
+        # Try window._sharedData (legacy IG)
+        """
+        try {
+            const u = window._sharedData?.entry_data?.ProfilePage?.[0]?.graphql?.user;
+            if (u && u.edge_owner_to_timeline_media) {
+                return u.edge_owner_to_timeline_media.count;
+            }
+        } catch(e) {}
+        return null;
+        """,
+        # Try __reactFiber / __reactProps traversal (modern IG)
+        """
+        try {
+            const root = document.getElementById('react-root') || document.body;
+            const fiberKey = Object.keys(root).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+            if (!fiberKey) return null;
+            let fiber = root[fiberKey];
+            let depth = 0;
+            while (fiber && depth < 200) {
+                const props = fiber.memoizedProps || {};
+                const data = props.data || props.initialData || props.serverData;
+                if (data?.user?.edge_owner_to_timeline_media?.count !== undefined) {
+                    return data.user.edge_owner_to_timeline_media.count;
+                }
+                fiber = fiber.child || fiber.sibling || (fiber.return && fiber.return.sibling);
+                depth++;
+            }
+        } catch(e) {}
+        return null;
+        """,
     ]
-
-    for pattern in patterns:
-        match = re.search(pattern, html)
-        if match:
-            try:
-                return int(match.group(1))
-            except Exception:
-                continue
-
-    return None
-
-
-def extract_post_count_from_meta(driver: webdriver.Chrome) -> Optional[int]:
-    metas = driver.find_elements(By.XPATH, "//meta[@property='og:description']")
-    for meta in metas:
-        content = (meta.get_attribute("content") or "").strip()
-        if not content:
-            continue
-
-        # Most robust case: English og:description like "123 posts, 4,567 followers..."
-        match = re.search(r"([0-9][0-9,\.KMBkmb]*)\s+posts?\b", content, flags=re.I)
-        if match:
-            count = normalize_count_text(match.group(1))
-            if count is not None:
-                return count
-
-        # Locale fallback: parse the first numeric token in og:description
-        match = re.search(r"^\s*([0-9][0-9,\.KMBkmb]*)\b", content)
-        if match:
-            count = normalize_count_text(match.group(1))
-            if count is not None:
-                return count
-
-    return None
-
-
-def extract_post_count_from_xpath(driver: webdriver.Chrome) -> Optional[int]:
-    xpaths = [
-        "//header//ul/li[1]//span[@title]",
-        "//header//ul/li[1]//span/span",
-        "//main//header//section//ul/li[1]//span[@title]",
-        "//main//header//section//ul/li[1]//span/span",
-    ]
-
-    for xpath in xpaths:
+    for script in scripts:
         try:
-            elements = driver.find_elements(By.XPATH, xpath)
-            for el in elements:
-                candidate = (el.get_attribute("title") or el.text or "").strip()
-                count = normalize_count_text(candidate)
-                if count is not None:
-                    return count
+            result = driver.execute_script(script)
+            if result is not None:
+                return int(result)
         except Exception:
             continue
     return None
 
 
+# [FIX #3] Extract full timeline edges from in-memory JS store
+def extract_timeline_from_js(driver: webdriver.Chrome) -> Optional[dict]:
+    """Pull the full edge_owner_to_timeline_media structure from JS memory."""
+    scripts = [
+        """
+        try {
+            const data = window.__additionalDataLoaded || {};
+            for (const key of Object.keys(data)) {
+                const u = (data[key]?.graphql?.user) || (data[key]?.data?.user);
+                if (u && u.edge_owner_to_timeline_media && u.edge_owner_to_timeline_media.edges) {
+                    return JSON.stringify({data: {user: u}});
+                }
+            }
+        } catch(e) {}
+        return null;
+        """,
+        """
+        try {
+            const u = window._sharedData?.entry_data?.ProfilePage?.[0]?.graphql?.user;
+            if (u && u.edge_owner_to_timeline_media && u.edge_owner_to_timeline_media.edges) {
+                return JSON.stringify({data: {user: u}});
+            }
+        } catch(e) {}
+        return null;
+        """,
+    ]
+    for script in scripts:
+        try:
+            result = driver.execute_script(script)
+            if result:
+                return json.loads(result)
+        except Exception:
+            continue
+    return None
+
+
+# [FIX #1] Wait for JS hydration before reading page source
+def wait_for_js_data(driver: webdriver.Chrome, timeout: int = 15) -> bool:
+    """Wait until Instagram's JS has injected timeline data into the page."""
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: (
+                "edge_owner_to_timeline_media" in (d.page_source or "")
+                or d.find_elements(By.XPATH, "//meta[@property='og:description']")
+            )
+        )
+        return True
+    except Exception:
+        return False
+
+
 def get_profile_post_count(driver: webdriver.Chrome, username: str) -> Optional[int]:
-    """Get post count using Selenium to establish proper session, then extract from page"""
+    """
+    Navigate to profile page, wait for JS hydration, then extract post count
+    via (in priority order):
+      1. Regex on page source (edge_owner_to_timeline_media count)
+      2. execute_script querying JS memory
+      3. og:description meta tag
+      4. XPath header stats
+    """
     try:
         url = f"https://www.instagram.com/{username}/"
         driver.get(url)
-        
-        # Wait only for body tag with short timeout
-        try:
-            WebDriverWait(driver, 5).until(
-                EC.presence_of_element_located((By.TAG_NAME, "body"))
-            )
-        except:
-            pass
-        
-        # No sleep - extract immediately
-        
-        # Try page_source first (fastest)
+
+        # [FIX #1] Wait for JS-hydrated data rather than just <body>
+        hydrated = wait_for_js_data(driver, timeout=15)
+        if not hydrated:
+            print(f"⚠️ {username}: page did not fully hydrate within timeout")
+
         html = driver.page_source or ""
+
+        # 1. Regex on page source
         patterns = [
             r'edge_owner_to_timeline_media\":\{\"count\":(\d+)',
             r'"edge_owner_to_timeline_media":\s*\{\s*"count":\s*(\d+)',
@@ -381,76 +461,110 @@ def get_profile_post_count(driver: webdriver.Chrome, username: str) -> Optional[
             if match:
                 try:
                     count = int(match.group(1))
-                    print(f"ℹ️ {username} current profile post count (page_source): {count}")
+                    print(f"ℹ️ {username} post count (page_source regex): {count}")
                     return count
                 except Exception:
                     continue
-        
-        # Try meta tag
+
+        # [FIX #3] 2. execute_script JS memory query
+        count = extract_count_from_js(driver)
+        if count is not None:
+            print(f"ℹ️ {username} post count (JS memory): {count}")
+            return count
+
+        # 3. og:description meta tag
         try:
             metas = driver.find_elements(By.XPATH, "//meta[@property='og:description']")
             for meta in metas:
                 content = (meta.get_attribute("content") or "").strip()
                 if not content:
                     continue
-                match = re.search(r"([0-9][0-9,\.KMBkmb]*)\s+posts?\b", content, flags=re.I)
-                if match:
-                    count = normalize_count_text(match.group(1))
+                m = re.search(r"([0-9][0-9,\.KMBkmb]*)\s+posts?\b", content, flags=re.I)
+                if m:
+                    count = normalize_count_text(m.group(1))
                     if count is not None:
-                        print(f"ℹ️ {username} current profile post count (meta): {count}")
+                        print(f"ℹ️ {username} post count (og:description): {count}")
                         return count
-        except:
+        except Exception:
             pass
-        
+
+        # 4. XPath header stats
+        xpaths = [
+            "//header//ul/li[1]//span[@title]",
+            "//header//ul/li[1]//span/span",
+            "//main//header//section//ul/li[1]//span[@title]",
+            "//main//header//section//ul/li[1]//span/span",
+        ]
+        for xpath in xpaths:
+            try:
+                elements = driver.find_elements(By.XPATH, xpath)
+                for el in elements:
+                    candidate = (el.get_attribute("title") or el.text or "").strip()
+                    count = normalize_count_text(candidate)
+                    if count is not None:
+                        print(f"ℹ️ {username} post count (XPath): {count}")
+                        return count
+            except Exception:
+                continue
+
         print(f"⚠️ Could not read post count for {username}")
         return None
+
     except Exception as exc:
-        print(f"❌ Error getting post count: {exc}")
+        print(f"❌ Error getting post count for {username}: {exc}")
         return None
 
 
 # ========= API fetch for changed accounts only =========
-def get_profile_info(username: str, driver: webdriver.Chrome):
-    """直接從目前已載入的 profile 頁面抽 timeline 資料，不重新開頁"""
+def get_profile_info(username: str, driver: webdriver.Chrome) -> Optional[dict]:
+    """
+    Extract timeline data from the currently loaded profile page.
+    Priority:
+      1. execute_script JS memory (most reliable on modern IG)
+      2. <script> tag JSON parsing
+      3. Regex fallback on raw HTML
+    NOTE: Call this immediately after get_profile_post_count() — driver must
+          still be on the profile page (no other driver.get() in between).
+    """
     if not driver:
         return None
 
     try:
         html = driver.page_source or ""
-        print(f"DEBUG profile html preview: {html[:1200]}")
 
+        # [FIX #3] 1. Try JS memory first — most reliable on modern IG
+        js_data = extract_timeline_from_js(driver)
+        if js_data:
+            print(f"✅ {username} extracted timeline from JS memory")
+            return js_data
+
+        # 2. Parse <script> tags
         script_texts = re.findall(r"<script[^>]*>(.*?)</script>", html, flags=re.S | re.I)
-
         for raw in script_texts:
             if "edge_owner_to_timeline_media" not in raw:
                 continue
-
             cleaned = raw.strip()
             candidates = [cleaned]
-
             brace_match = re.search(r"(\{.*\})", cleaned, flags=re.S)
             if brace_match:
                 candidates.append(brace_match.group(1))
-
             for candidate in candidates:
                 try:
                     blob = json.loads(candidate)
                     result = find_timeline_data(blob)
                     if result:
-                        print(f"✅ {username} extracted profile JSON from current page")
+                        print(f"✅ {username} extracted timeline from <script> JSON")
                         return result
                 except Exception:
                     continue
 
-        # fallback: 直接從 HTML regex 抽
+        # 3. Regex fallback on raw HTML
         edges = []
-        seen = set()
-
+        seen: set = set()
         pattern = re.compile(
             r'"shortcode":"(?P<shortcode>[^"]+)".{0,2000}?"is_video":(?P<is_video>true|false).{0,4000}?"taken_at_timestamp":(?P<ts>\d+)',
-            flags=re.S
+            flags=re.S,
         )
-
         for m in pattern.finditer(html):
             shortcode = m.group("shortcode")
             if shortcode in seen:
@@ -468,7 +582,7 @@ def get_profile_info(username: str, driver: webdriver.Chrome):
             cap_match = re.search(
                 r'"edge_media_to_caption":\{"edges":\[\{"node":\{"text":"(.*?)"\}\}\]\}',
                 snippet,
-                flags=re.S
+                flags=re.S,
             )
             if cap_match:
                 caption = bytes(cap_match.group(1), "utf-8").decode("unicode_escape", errors="ignore")
@@ -494,18 +608,16 @@ def get_profile_info(username: str, driver: webdriver.Chrome):
             })
 
         if edges:
-            print(f"✅ {username} extracted {len(edges)} timeline nodes from current page fallback")
+            print(f"✅ {username} extracted {len(edges)} timeline nodes via HTML regex fallback")
             return {
                 "data": {
                     "user": {
-                        "edge_owner_to_timeline_media": {
-                            "edges": edges
-                        }
+                        "edge_owner_to_timeline_media": {"edges": edges}
                     }
                 }
             }
 
-        print(f"⚠️ {username} could not extract profile JSON from current page")
+        print(f"⚠️ {username} could not extract timeline data from current page")
         return None
 
     except Exception as exc:
@@ -513,26 +625,22 @@ def get_profile_info(username: str, driver: webdriver.Chrome):
         return None
 
 
-def find_timeline_data(obj, depth=0) -> Optional[dict]:
-    """遞迴搜尋包含 edge_owner_to_timeline_media 的結構"""
+def find_timeline_data(obj, depth: int = 0) -> Optional[dict]:
+    """Recursively search a parsed JSON blob for edge_owner_to_timeline_media."""
     if depth > 10:
         return None
-
     if isinstance(obj, dict):
         if "edge_owner_to_timeline_media" in obj:
-            # 包成 extract_reels_within_days 期望的格式
             return {"data": {"user": obj}}
         for v in obj.values():
             result = find_timeline_data(v, depth + 1)
             if result:
                 return result
-
     elif isinstance(obj, list):
         for item in obj:
             result = find_timeline_data(item, depth + 1)
             if result:
                 return result
-
     return None
 
 
@@ -545,10 +653,9 @@ def extract_reels_within_days(username: str, profile_json: dict, existing_shortc
     except Exception as exc:
         print(f"⚠️ {username} profile JSON structure error: {exc}, skipping reel extraction")
         return results
-    
-    # If no edges found, that's OK - just return empty
+
     if not edges:
-        print(f"ℹ️ {username} no timeline data available, skipping reel extraction")
+        print(f"ℹ️ {username} no timeline edges available, skipping reel extraction")
         return results
 
     cutoff = now_local() - dt.timedelta(days=REELS_WINDOW_DAYS)
@@ -587,60 +694,89 @@ def extract_reels_within_days(username: str, profile_json: dict, existing_shortc
     return results
 
 
-def get_reel_detail_by_shortcode(shortcode: str, driver: Optional[webdriver.Chrome] = None):
-    """Extract reel detail from page HTML using XPath - no API calls"""
+def get_reel_detail_by_shortcode(shortcode: str, driver: Optional[webdriver.Chrome] = None) -> Optional[dict]:
+    """
+    Navigate to reel page and extract engagement metrics.
+    Tries JS memory first, then page source regex.
+    """
     if not driver:
         return None
-    
+
     try:
         driver.get(f"https://www.instagram.com/reel/{shortcode}/")
-        time.sleep(0.3)
-        
+
+        # [FIX #1] Wait for page data to hydrate
+        wait_for_js_data(driver, timeout=10)
+
         html = driver.page_source or ""
-        
-        # Look for the media data in page source
-        # Instagram stores it as JSON in the page
-        match = re.search(r'"shortcode":"' + shortcode + r'".*?"__typename":"GraphImage".*?}', html)
-        if not match:
-            match = re.search(r'"shortcode":"' + shortcode + r'".*?"edge_media_to_caption".*?}', html)
-        
-        if match:
-            try:
-                json_str = match.group(0)
-                # Extract key metrics from page
-                node = {
-                    "video_view_count": 0,
-                    "video_play_count": 0,
-                    "edge_liked_by": {"count": 0},
-                    "edge_media_to_comment": {"count": 0},
-                }
-                
-                # Try to extract view count
-                view_match = re.search(r'"video_view_count":(\d+)', html)
-                if view_match:
-                    node["video_view_count"] = int(view_match.group(1))
-                
-                # Try to extract play count
-                play_match = re.search(r'"video_play_count":(\d+)', html)
-                if play_match:
-                    node["video_play_count"] = int(play_match.group(1))
-                
-                # Try to extract likes
-                like_match = re.search(r'"edge_liked_by":\s*\{\s*"count":(\d+)', html)
-                if like_match:
-                    node["edge_liked_by"]["count"] = int(like_match.group(1))
-                
-                # Try to extract comments
-                comment_match = re.search(r'"edge_media_to_comment":\s*\{\s*"count":(\d+)', html)
-                if comment_match:
-                    node["edge_media_to_comment"]["count"] = int(comment_match.group(1))
-                
-                return node
-            except Exception as e:
-                print(f"⚠️ Parse error for {shortcode}: {e}")
-        
+
+        node: dict = {
+            "video_view_count": 0,
+            "video_play_count": 0,
+            "edge_liked_by": {"count": 0},
+            "edge_media_to_comment": {"count": 0},
+        }
+        found_any = False
+
+        # 1. Try JS memory for the reel node
+        try:
+            result = driver.execute_script(f"""
+                try {{
+                    const data = window.__additionalDataLoaded || {{}};
+                    for (const key of Object.keys(data)) {{
+                        const items = data[key]?.items || [];
+                        for (const item of items) {{
+                            if (item.code === '{shortcode}' || item.shortcode === '{shortcode}') {{
+                                return JSON.stringify({{
+                                    view_count: item.view_count || item.play_count || 0,
+                                    play_count: item.play_count || 0,
+                                    like_count: item.like_count || 0,
+                                    comment_count: item.comment_count || 0
+                                }});
+                            }}
+                        }}
+                    }}
+                }} catch(e) {{}}
+                return null;
+            """)
+            if result:
+                d = json.loads(result)
+                node["video_view_count"] = d.get("view_count", 0)
+                node["video_play_count"] = d.get("play_count", 0)
+                node["edge_liked_by"]["count"] = d.get("like_count", 0)
+                node["edge_media_to_comment"]["count"] = d.get("comment_count", 0)
+                found_any = True
+        except Exception:
+            pass
+
+        # 2. Regex fallback on page source
+        if not found_any:
+            view_match = re.search(r'"video_view_count":(\d+)', html)
+            if view_match:
+                node["video_view_count"] = int(view_match.group(1))
+                found_any = True
+
+            play_match = re.search(r'"video_play_count":(\d+)', html)
+            if play_match:
+                node["video_play_count"] = int(play_match.group(1))
+                found_any = True
+
+            like_match = re.search(r'"edge_liked_by":\s*\{\s*"count":(\d+)', html)
+            if like_match:
+                node["edge_liked_by"]["count"] = int(like_match.group(1))
+                found_any = True
+
+            comment_match = re.search(r'"edge_media_to_comment":\s*\{\s*"count":(\d+)', html)
+            if comment_match:
+                node["edge_media_to_comment"]["count"] = int(comment_match.group(1))
+                found_any = True
+
+        if found_any:
+            return node
+
+        print(f"⚠️ No metrics found for reel {shortcode}")
         return None
-        
+
     except Exception as exc:
         print(f"❌ Error getting reel detail {shortcode}: {exc}")
         return None
@@ -673,7 +809,13 @@ def build_dynamic_snapshot(shortcode: str, node: dict) -> dict:
     }
 
 
-def upsert_state_row(state_df: pd.DataFrame, username: str, current_count: Optional[int], status: str, changed: bool) -> pd.DataFrame:
+def upsert_state_row(
+    state_df: pd.DataFrame,
+    username: str,
+    current_count: Optional[int],
+    status: str,
+    changed: bool,
+) -> pd.DataFrame:
     checked_at = now_str()
     changed_at = checked_at if changed else None
 
@@ -699,10 +841,8 @@ def upsert_state_row(state_df: pd.DataFrame, username: str, current_count: Optio
 def main() -> None:
     start_ts = time.time()
 
-    # Ensure data directory exists
     ensure_parent_dir(KOL_INFO_FILE)
 
-    # Initialize sample kol_info.csv if missing
     if not os.path.exists(KOL_INFO_FILE):
         print(f"⚠️ {KOL_INFO_FILE} not found, creating sample file")
         sample_df = pd.DataFrame({"kol_account": ["instagram", "nasa", "cristiano"]})
@@ -737,12 +877,17 @@ def main() -> None:
 
     driver = build_driver()
 
-    # 注入 cookie
+    # Inject cookies
     cookie_str = os.environ.get("IG_COOKIE", "")
     if cookie_str:
         load_cookies_from_string(driver, cookie_str)
+
+        # [FIX #4] Verify login before proceeding
+        if not verify_logged_in(driver):
+            print("⚠️ Login verification failed. Timeline data may be unavailable.")
+            print("⚠️ Check that IG_COOKIE is valid and not expired.")
     else:
-        print("⚠️ IG_COOKIE not set, may be blocked")
+        print("⚠️ IG_COOKIE not set — authenticated data will not be available")
 
     try:
         for _, row in kol_df.iterrows():
@@ -761,6 +906,9 @@ def main() -> None:
                     except Exception:
                         previous_count = None
 
+            # [FIX #1+#2] get_profile_post_count now waits for JS hydration.
+            # get_profile_info MUST be called immediately after, before any
+            # other driver.get() call, so it can reuse the already-loaded page.
             current_count = get_profile_post_count(driver, username)
             processed += 1
 
@@ -780,6 +928,7 @@ def main() -> None:
             state_df = upsert_state_row(state_df, username, current_count, "changed_fetching", True)
             changed_accounts += 1
 
+            # [FIX #2] Call get_profile_info immediately — driver is still on the profile page
             profile_json = get_profile_info(username, driver)
             if not profile_json:
                 print(f"⏭️ {username} profile data unavailable, skipping reel extraction")
@@ -792,6 +941,9 @@ def main() -> None:
 
             for static_row in recent_new_reels:
                 shortcode = static_row["reels_shortcode"]
+
+                # get_reel_detail_by_shortcode will navigate away from profile page —
+                # that is intentional here; profile data is already captured above.
                 detail_node = get_reel_detail_by_shortcode(shortcode, driver)
 
                 if detail_node:
@@ -814,8 +966,12 @@ def main() -> None:
     finally:
         driver.quit()
 
-    static_df = dedupe_and_sort_static(pd.concat([static_df, pd.DataFrame(new_static_rows)], ignore_index=True))
-    dynamic_df = dedupe_and_sort_dynamic(pd.concat([dynamic_df, pd.DataFrame(new_dynamic_rows)], ignore_index=True))
+    static_df = dedupe_and_sort_static(
+        pd.concat([static_df, pd.DataFrame(new_static_rows)], ignore_index=True)
+    )
+    dynamic_df = dedupe_and_sort_dynamic(
+        pd.concat([dynamic_df, pd.DataFrame(new_dynamic_rows)], ignore_index=True)
+    )
     state_df = dedupe_and_sort_state(state_df)
 
     save_csv(static_df, STATIC_FILE, STATIC_COLUMNS)
@@ -824,10 +980,10 @@ def main() -> None:
 
     elapsed = round(time.time() - start_ts, 2)
     print("\n✅ Done")
-    print(f"✅ Processed accounts: {processed}")
-    print(f"✅ Changed accounts: {changed_accounts}")
-    print(f"✅ Skipped accounts: {skipped_accounts}")
-    print(f"✅ Total runtime: {elapsed} seconds")
+    print(f"✅ Processed accounts : {processed}")
+    print(f"✅ Changed accounts   : {changed_accounts}")
+    print(f"✅ Skipped accounts   : {skipped_accounts}")
+    print(f"✅ Total runtime      : {elapsed} seconds")
 
 
 if __name__ == "__main__":
