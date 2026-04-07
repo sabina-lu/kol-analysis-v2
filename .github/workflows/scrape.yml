@@ -52,7 +52,7 @@ jobs:
         env:
           TZ: Asia/Taipei
         run: |
-          python get_new_reels.py
+          python update_reels.py
 
       - name: Commit and push CSV updates
         run: |
@@ -103,7 +103,7 @@ jobs:
           IG_COOKIE: ${{ secrets.IG_COOKIE }}
           TZ: Asia/Taipei
         run: |
-          python kol_new_posts_scraper.py \
+          python get_new_reels.py \
             --kol    data/kol_list.csv \
             --static data/reels_static_info.csv \
             --days   2
