@@ -194,30 +194,30 @@ def safe_json_get(url: str, headers: dict, referer: Optional[str] = None, timeou
     return None
 
 
-def normalize_count_text(text: str) -> Optional[int]:
-    if text is None:
-        return None
+# def normalize_count_text(text: str) -> Optional[int]:
+#     if text is None:
+#         return None
 
-    raw = str(text).strip()
-    if not raw:
-        return None
+#     raw = str(text).strip()
+#     if not raw:
+#         return None
 
-    raw = raw.replace(",", "").replace(" ", "")
-    match = re.search(r"(\d+(?:\.\d+)?)([KMBkmb]?)", raw)
-    if not match:
-        return None
+#     raw = raw.replace(",", "").replace(" ", "")
+#     match = re.search(r"(\d+(?:\.\d+)?)([KMBkmb]?)", raw)
+#     if not match:
+#         return None
 
-    value = float(match.group(1))
-    unit = match.group(2).lower()
+#     value = float(match.group(1))
+#     unit = match.group(2).lower()
 
-    if unit == "k":
-        value *= 1_000
-    elif unit == "m":
-        value *= 1_000_000
-    elif unit == "b":
-        value *= 1_000_000_000
+#     if unit == "k":
+#         value *= 1_000
+#     elif unit == "m":
+#         value *= 1_000_000
+#     elif unit == "b":
+#         value *= 1_000_000_000
 
-    return int(round(value))
+#     return int(round(value))
 
 
 # ========= Selenium profile gate =========
@@ -422,36 +422,36 @@ def extract_timeline_from_js(driver: webdriver.Chrome) -> Optional[dict]:
     return None
 
 
-# [FIX #1] Wait for JS hydration before reading page source
-def wait_for_profile_ready(driver: webdriver.Chrome, timeout: int = 20) -> bool:
-    try:
-        WebDriverWait(driver, timeout).until(
-            lambda d: d.execute_script("return document.readyState") == "complete"
-        )
+# # [FIX #1] Wait for JS hydration before reading page source
+# def wait_for_profile_ready(driver: webdriver.Chrome, timeout: int = 20) -> bool:
+#     try:
+#         WebDriverWait(driver, timeout).until(
+#             lambda d: d.execute_script("return document.readyState") == "complete"
+#         )
 
-        for _ in range(8):
-            # 1) JS memory 有資料
-            js_ok = extract_timeline_from_js(driver) is not None
-            if js_ok:
-                return True
+#         for _ in range(8):
+#             # 1) JS memory 有資料
+#             js_ok = extract_timeline_from_js(driver) is not None
+#             if js_ok:
+#                 return True
 
-            # 2) DOM 已經有貼文/reel 連結
-            anchors = driver.find_elements(
-                By.XPATH,
-                '//a[@href and (contains(@href, "/p/") or contains(@href, "/reel/") or starts-with(@href, "/p/") or starts-with(@href, "/reel/"))]'
-            )
-            if anchors:
-                return True
+#             # 2) DOM 已經有貼文/reel 連結
+#             anchors = driver.find_elements(
+#                 By.XPATH,
+#                 '//a[@href and (contains(@href, "/p/") or contains(@href, "/reel/") or starts-with(@href, "/p/") or starts-with(@href, "/reel/"))]'
+#             )
+#             if anchors:
+#                 return True
 
-            # 3) 幫助 lazy load / hydration
-            driver.execute_script("window.scrollTo(0, 500);")
-            time.sleep(1.2)
-            driver.execute_script("window.scrollTo(0, 0);")
-            time.sleep(1.2)
+#             # 3) 幫助 lazy load / hydration
+#             driver.execute_script("window.scrollTo(0, 500);")
+#             time.sleep(1.2)
+#             driver.execute_script("window.scrollTo(0, 0);")
+#             time.sleep(1.2)
 
-        return False
-    except Exception:
-        return False
+#         return False
+#     except Exception:
+#         return False
 
 
 def get_profile_post_count(driver: webdriver.Chrome, username: str) -> Optional[int]:
@@ -556,11 +556,17 @@ def get_profile_info(username: str, driver: webdriver.Chrome) -> Optional[dict]:
             print(f"✅ {username} extracted timeline from JS memory")
             return js_data
 
-        # 2. DOM fallback: 從頁面上已經 render 的連結建 edges
-        anchors = anchors[:3]
+        # 2. DOM fallback: 從頁面上已 render 的連結建 edges，只取前 3 個有效項目
+        anchors = driver.find_elements(
+            By.XPATH,
+            '//a[@href and (contains(@href, "/p/") or contains(@href, "/reel/") or starts-with(@href, "/p/") or starts-with(@href, "/reel/"))]'
+        )
+
+        print(f"ℹ️ {username} raw anchors found: {len(anchors)}")
 
         seen = set()
         edges = []
+        max_items = 3
 
         for a in anchors:
             href = a.get_attribute("href") or ""
@@ -582,8 +588,8 @@ def get_profile_info(username: str, driver: webdriver.Chrome) -> Optional[dict]:
 
             if not shortcode or shortcode in seen:
                 continue
-            seen.add(shortcode)
 
+            seen.add(shortcode)
             edges.append({
                 "node": {
                     "shortcode": shortcode,
@@ -593,9 +599,14 @@ def get_profile_info(username: str, driver: webdriver.Chrome) -> Optional[dict]:
                     "edge_media_to_caption": {"edges": []},
                 }
             })
-         
+
+            print(f"  + edge shortcode={shortcode} is_video={is_video}")
+
+            if len(edges) >= max_items:
+                break
+
         if edges:
-            print(f"✅ {username} extracted {len(edges)} timeline nodes from DOM anchors")
+            print(f"✅ {username} extracted {len(edges)} timeline nodes from DOM anchors (limited to {max_items})")
             return {
                 "data": {
                     "user": {
@@ -606,7 +617,7 @@ def get_profile_info(username: str, driver: webdriver.Chrome) -> Optional[dict]:
                 }
             }
 
-        # 3. 原本 script / regex fallback 保留
+        # 3. script fallback
         script_texts = re.findall(r"<script[^>]*>(.*?)</script>", html, flags=re.S | re.I)
         for raw in script_texts:
             if "edge_owner_to_timeline_media" not in raw:
