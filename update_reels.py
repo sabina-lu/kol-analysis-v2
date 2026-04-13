@@ -256,7 +256,11 @@ class InstagramReelScraper:
         return ReelSummary(
             shortcode=item.get("shortcode") or shortcode,
             caption=caption,
-            taken_at=item.get("taken_at"),
+            taken_at=(
+                item.get("taken_at")
+                or item.get("taken_at_timestamp")
+                or item.get("published_at")
+            ),
             video_duration=item.get("video_duration"),
             like_count=like_count,
             comment_count=comment_count,
@@ -273,7 +277,11 @@ class InstagramReelScraper:
         return ReelSummary(
             shortcode=item.get("code") or shortcode,
             caption=caption_obj.get("text"),
-            taken_at=item.get("taken_at"),
+            taken_at=(
+                item.get("taken_at")
+                or item.get("taken_at_timestamp")
+                or item.get("published_at")
+            ),
             video_duration=item.get("video_duration"),
             like_count=item.get("like_count"),
             comment_count=item.get("comment_count"),
@@ -328,8 +336,15 @@ def should_fill_static_field(value: str) -> bool:
     return value.strip() == ""
 
 
-def fill_static_fields(row: Dict[str, str], result: ReelSummary) -> bool:
-    updated_fields = {}
+def needs_static_update(row: Dict[str, str]) -> bool:
+    return any(
+        not (row.get(field) or "").strip()
+        for field in ["post_time", "duration", "caption"]
+    )
+
+
+def fill_static_fields(row: Dict[str, str], result: ReelSummary) -> Dict[str, str]:
+    updated_fields: Dict[str, str] = {}
 
     post_time = ts_to_str(result.taken_at)
     duration = "" if result.video_duration is None else str(result.video_duration)
@@ -375,11 +390,13 @@ def batch_scrape(
         try:
             result = scraper.get_reel_data(shortcode)
 
-            updated = fill_static_fields(row, result)
+            updated = {}
 
-            if updated:
-                static_updated_count += 1
-                print(f"✓ static updated [{shortcode}] → {updated}")
+            if needs_static_update(row):
+                updated = fill_static_fields(row, result)
+                if updated:
+                    static_updated_count += 1
+                    print(f"✓ static updated [{shortcode}] → {updated}")
 
             append_dynamic_row(dynamic_csv, {
                 "reels_shortcode": result.shortcode,
